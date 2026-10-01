@@ -6,17 +6,30 @@ from urllib.parse import urlparse
 from .oracle_extractor import OracleExtractor
 from .postgres_extractor import PostgresExtractor
 
+def _schema_names(schemas: list[str] | None) -> list[str] | None:
+    if not schemas:
+        return None
+    names = []
+    for schema in schemas:
+        name = schema.strip()
+        if not name:
+            raise ValueError("--schema must be a non-empty name")
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def schema_file_name(database_name: str, db_type: str, when: datetime | None = None) -> str:
     timestamp = (when or datetime.now()).strftime("%Y-%m-%d-%H-%M-%S")
     safe_name = database_name.replace("/", "_").replace("\\", "_")
     return f"{safe_name}_{db_type}-{timestamp}.json"
 
-def extractor_for(uri: str):
+def extractor_for(uri: str, schemas: list[str] | None = None):
     scheme = urlparse(uri).scheme.lower()
     if scheme in {"postgres", "postgresql"}:
-        return PostgresExtractor(uri)
+        return PostgresExtractor(uri, schemas)
     if scheme == "oracle":
-        return OracleExtractor(uri)
+        return OracleExtractor(uri, schemas)
     raise ValueError(f"Unsupported database URI scheme: {scheme or 'missing'}")
 
 def main() -> None:
@@ -24,13 +37,23 @@ def main() -> None:
     parser.add_argument("uri", help="Database connection URI")
     parser.add_argument("output_folder", help="Folder where the schema JSON is written")
     parser.add_argument(
+        "--schema",
+        action="append",
+        dest="schemas",
+        help=(
+            "Schema to extract. Repeat to include more than one. "
+            "Defaults to the session schema. Names are folded to lowercase "
+            "on Postgres and uppercase on Oracle."
+        ),
+    )
+    parser.add_argument(
         "--file_name",
         help="Output file name. Defaults to {db-name}_{db-type}-{YYYY-MM-DD-HH-MM-SS}.json",
     )
     args = parser.parse_args()
 
     try:
-        extractor = extractor_for(args.uri)
+        extractor = extractor_for(args.uri, _schema_names(args.schemas))
     except ValueError as exc:
         parser.error(str(exc))
 

@@ -20,7 +20,7 @@ class OracleExtractor(BaseExtractor):
                 cursor,
                 "SELECT SYS_CONTEXT('USERENV', 'DB_NAME') AS database_name FROM dual",
             )[0]["database_name"]
-            visible_tables = _visible_tables(cursor)
+            visible_tables = _visible_tables(cursor, _selected_schemas(self.schemas))
             if not visible_tables:
                 return SchemaDump(database_name=database_name, tables=[])
 
@@ -140,7 +140,7 @@ def _schema_from_rows(
         if key in foreign_keys:
             continue
         target = f"{row['foreign_table_name']}.{row['foreign_column_name']}"
-        if row["foreign_owner"] != row["owner"]:
+        if qualify_names or row["foreign_owner"] != row["owner"]:
             target = f"{row['foreign_owner']}.{target}"
         foreign_keys[key] = target
 
@@ -169,42 +169,40 @@ def _schema_from_rows(
     return SchemaDump(database_name=database_name, tables=list(tables.values()))
 
 
-def _visible_tables(cursor) -> list[tuple[str, str]]:
-    owned = _fetch_dicts(cursor, """
-        SELECT owner, table_name
-        FROM all_tables
-        WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
-          AND nested = 'NO'
-          AND iot_name IS NULL
-    """)
-    referenced = _fetch_dicts(cursor, """
-        SELECT DISTINCT referenced_owner AS owner, referenced_name AS table_name
-        FROM all_dependencies
-        WHERE owner = USER
-          AND referenced_type = 'TABLE'
-    """)
-    synonyms = _fetch_dicts(cursor, """
-        SELECT DISTINCT table_owner AS owner, table_name
-        FROM all_synonyms
-        WHERE owner = USER
-          AND table_owner IS NOT NULL
-    """)
-    candidates: dict[str, set[str]] = {}
-    for row in (*owned, *referenced, *synonyms):
-        if row["owner"] and row["table_name"]:
-            candidates.setdefault(row["owner"], set()).add(row["table_name"])
+def _selected_schemas(schemas: list[str] | None) -> list[str] | None:
+    if not schemas:
+        return None
+    selected = []
+    for schema in schemas:
+        name = schema.upper()
+        if name not in selected:
+            selected.append(name)
+    return selected
 
-    visible = []
-    for owner, names in candidates.items():
-        rows = _rows_by_owner(cursor, [(owner, name) for name in names], """
+
+def _visible_tables(cursor, schemas: list[str] | None) -> list[tuple[str, str]]:
+    if not schemas:
+        rows = _fetch_dicts(cursor, """
             SELECT owner, table_name
             FROM all_tables
-            WHERE owner = :owner
-              AND table_name IN ({tables})
+            WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
               AND nested = 'NO'
               AND iot_name IS NULL
             ORDER BY table_name
         """)
+        return [(row["owner"], row["table_name"]) for row in rows]
+
+    visible = []
+    for offset in range(0, len(schemas), 500):
+        placeholders, binds = _in_binds(schemas[offset:offset + 500], prefix="schema")
+        rows = _fetch_dicts(cursor, """
+            SELECT owner, table_name
+            FROM all_tables
+            WHERE owner IN ({schemas})
+              AND nested = 'NO'
+              AND iot_name IS NULL
+            ORDER BY owner, table_name
+        """.format(schemas=placeholders), binds)
         visible.extend((row["owner"], row["table_name"]) for row in rows)
     return visible
 
@@ -223,9 +221,9 @@ def _rows_by_owner(cursor, tables: list[tuple[str, str]], query: str) -> list[di
     return rows
 
 
-def _in_binds(names: list[str]) -> tuple[str, dict[str, str]]:
-    binds = {f"table_{index}": name for index, name in enumerate(names)}
-    placeholders = ", ".join(f":table_{index}" for index in range(len(names)))
+def _in_binds(names: list[str], prefix: str = "table") -> tuple[str, dict[str, str]]:
+    binds = {f"{prefix}_{index}": name for index, name in enumerate(names)}
+    placeholders = ", ".join(f":{prefix}_{index}" for index in range(len(names)))
     return placeholders, binds
 
 

@@ -8,8 +8,9 @@ class BaseExtractor(ABC):
     Implements the context manager protocol for safe connection handling.
     """
     
-    def __init__(self, connection_uri: str):
+    def __init__(self, connection_uri: str, schemas: list[str] | None = None):
         self.connection_uri = connection_uri
+        self.schemas = schemas
         self.connection: Any = None
 
     def __enter__(self):
