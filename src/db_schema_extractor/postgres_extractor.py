@@ -2,7 +2,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .base_extractor import BaseExtractor
-from .models import ColumnMetadata, SchemaDump, TableMetadata
+from .models import ColumnMetadata, ForeignKeyMetadata, SchemaDump, TableMetadata
 
 _TABLES_QUERY = """
     SELECT
@@ -54,6 +54,7 @@ _FOREIGN_KEYS_QUERY = """
     SELECT
         n.nspname AS table_schema,
         c.relname AS table_name,
+        con.conname AS constraint_name,
         a.attname AS column_name,
         fn.nspname AS foreign_schema,
         fc.relname AS foreign_table_name,
@@ -132,21 +133,14 @@ def _schema_from_rows(
         (row["table_schema"], row["table_name"], row["column_name"])
         for row in primary_key_rows
     }
-    foreign_keys: dict[tuple[str, str, str], str] = {}
-    for row in foreign_key_rows:
-        key = (row["table_schema"], row["table_name"], row["column_name"])
-        if key in foreign_keys:
-            continue
-        target = f"{row['foreign_table_name']}.{row['foreign_column_name']}"
-        if qualify_names or row["foreign_schema"] != row["table_schema"]:
-            target = f"{row['foreign_schema']}.{target}"
-        foreign_keys[key] = target
+    foreign_keys = _foreign_keys(foreign_key_rows, qualify_names)
 
     tables = {
         (row["table_schema"], row["table_name"]): TableMetadata(
             name=_table_name(row["table_schema"], row["table_name"], qualify_names),
             description=row["description"],
             columns=[],
+            foreign_keys=foreign_keys.get((row["table_schema"], row["table_name"]), []),
         )
         for row in table_rows
     }
@@ -160,11 +154,34 @@ def _schema_from_rows(
             data_type=row["data_type"],
             is_nullable=row["is_nullable"],
             is_primary_key=key in primary_keys,
-            foreign_key_target=foreign_keys.get(key),
             description=row["description"],
         ))
 
     return SchemaDump(database_name=database_name, tables=list(tables.values()))
+
+
+def _foreign_keys(rows: list[dict], qualify_names: bool) -> dict[tuple[str, str], list[ForeignKeyMetadata]]:
+    by_table: dict[tuple[str, str], list[ForeignKeyMetadata]] = {}
+    by_constraint: dict[tuple[str, str, str], ForeignKeyMetadata] = {}
+    for row in rows:
+        table_key = (row["table_schema"], row["table_name"])
+        constraint_key = (*table_key, row["constraint_name"])
+        foreign_key = by_constraint.get(constraint_key)
+        if foreign_key is None:
+            target_table = row["foreign_table_name"]
+            if qualify_names or row["foreign_schema"] != row["table_schema"]:
+                target_table = f"{row['foreign_schema']}.{target_table}"
+            foreign_key = ForeignKeyMetadata(
+                name=row["constraint_name"],
+                columns=[],
+                target_table=target_table,
+                target_columns=[],
+            )
+            by_constraint[constraint_key] = foreign_key
+            by_table.setdefault(table_key, []).append(foreign_key)
+        foreign_key.columns.append(row["column_name"])
+        foreign_key.target_columns.append(row["foreign_column_name"])
+    return by_table
 
 
 def _table_name(schema: str, table_name: str, qualify: bool) -> str:

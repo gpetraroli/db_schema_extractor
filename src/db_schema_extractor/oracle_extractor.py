@@ -2,7 +2,7 @@ import oracledb
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .base_extractor import BaseExtractor
-from .models import ColumnMetadata, SchemaDump, TableMetadata
+from .models import ColumnMetadata, ForeignKeyMetadata, SchemaDump, TableMetadata
 
 class OracleExtractor(BaseExtractor):
     db_type = "oracle"
@@ -69,6 +69,7 @@ class OracleExtractor(BaseExtractor):
                 SELECT
                     cons.owner,
                     cols.table_name,
+                    cons.constraint_name,
                     cols.column_name,
                     rcols.owner AS foreign_owner,
                     rcols.table_name AS foreign_table_name,
@@ -87,6 +88,7 @@ class OracleExtractor(BaseExtractor):
                 WHERE cons.constraint_type = 'R'
                   AND cons.owner = :owner
                   AND cons.table_name IN ({tables})
+                ORDER BY cols.table_name, cons.constraint_name, cols.position
             """)
 
         return _schema_from_rows(
@@ -134,21 +136,14 @@ def _schema_from_rows(
     primary_keys = {
         (row["owner"], row["table_name"], row["column_name"]) for row in primary_key_rows
     }
-    foreign_keys: dict[tuple[str, str, str], str] = {}
-    for row in foreign_key_rows:
-        key = (row["owner"], row["table_name"], row["column_name"])
-        if key in foreign_keys:
-            continue
-        target = f"{row['foreign_table_name']}.{row['foreign_column_name']}"
-        if qualify_names or row["foreign_owner"] != row["owner"]:
-            target = f"{row['foreign_owner']}.{target}"
-        foreign_keys[key] = target
+    foreign_keys = _foreign_keys(foreign_key_rows, qualify_names)
 
     tables = {
         (row["owner"], row["table_name"]): TableMetadata(
             name=_table_name(row["owner"], row["table_name"], qualify_names),
             description=row["table_description"],
             columns=[],
+            foreign_keys=foreign_keys.get((row["owner"], row["table_name"]), []),
         )
         for row in table_rows
     }
@@ -162,7 +157,6 @@ def _schema_from_rows(
             data_type=row["data_type"],
             is_nullable=row["nullable"] == "Y",
             is_primary_key=key in primary_keys,
-            foreign_key_target=foreign_keys.get(key),
             description=row["description"],
         ))
 
@@ -225,6 +219,30 @@ def _in_binds(names: list[str], prefix: str = "table") -> tuple[str, dict[str, s
     binds = {f"{prefix}_{index}": name for index, name in enumerate(names)}
     placeholders = ", ".join(f":{prefix}_{index}" for index in range(len(names)))
     return placeholders, binds
+
+
+def _foreign_keys(rows: list[dict], qualify_names: bool) -> dict[tuple[str, str], list[ForeignKeyMetadata]]:
+    by_table: dict[tuple[str, str], list[ForeignKeyMetadata]] = {}
+    by_constraint: dict[tuple[str, str, str], ForeignKeyMetadata] = {}
+    for row in rows:
+        table_key = (row["owner"], row["table_name"])
+        constraint_key = (*table_key, row["constraint_name"])
+        foreign_key = by_constraint.get(constraint_key)
+        if foreign_key is None:
+            target_table = row["foreign_table_name"]
+            if qualify_names or row["foreign_owner"] != row["owner"]:
+                target_table = f"{row['foreign_owner']}.{target_table}"
+            foreign_key = ForeignKeyMetadata(
+                name=row["constraint_name"],
+                columns=[],
+                target_table=target_table,
+                target_columns=[],
+            )
+            by_constraint[constraint_key] = foreign_key
+            by_table.setdefault(table_key, []).append(foreign_key)
+        foreign_key.columns.append(row["column_name"])
+        foreign_key.target_columns.append(row["foreign_column_name"])
+    return by_table
 
 
 def _table_name(owner: str, table_name: str, qualify: bool) -> str:
