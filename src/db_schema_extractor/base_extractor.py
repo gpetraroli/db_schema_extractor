@@ -1,7 +1,12 @@
+import shutil
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+
+
+class MissingToolError(RuntimeError):
+    """A database client required by an extractor is not on PATH."""
 
 
 class BaseExtractor(ABC):
@@ -9,6 +14,8 @@ class BaseExtractor(ABC):
     Abstract base class for all database schema extractors.
     Implements the context manager protocol for safe connection handling.
     """
+
+    required_tools: tuple[str, ...] = ()
 
     def __init__(self, connection_uri: str, schemas: list[str] | None = None):
         self.connection_uri = connection_uri
@@ -45,6 +52,31 @@ class BaseExtractor(ABC):
         pass
 
 
+def require_tools(tools: tuple[str, ...]) -> None:
+    missing = [tool for tool in tools if shutil.which(tool) is None]
+    if not missing:
+        return
+    lines = [f"{tool} was not found on PATH." for tool in missing]
+    lines.append(_install_hint(missing))
+    raise MissingToolError("\n".join(lines))
+
+
+def _install_hint(missing: list[str]) -> str:
+    if missing == ["pg_dump"]:
+        install = (
+            "Install the PostgreSQL client tools, with a major version the same as "
+            "the server or newer. On Debian or Ubuntu: sudo apt install postgresql-client"
+        )
+    elif set(missing) <= {"expdp", "impdp"}:
+        install = (
+            "Install Oracle Instant Client Tools, which provides expdp and impdp, "
+            "and put that directory on PATH."
+        )
+    else:
+        install = "Install the missing program and make sure it is on PATH."
+    return f"{install}\nOr use the Docker image, which already includes it."
+
+
 def run_tool(
     command: list[str],
     *,
@@ -63,7 +95,9 @@ def run_tool(
             env=env,
         )
     except FileNotFoundError:
-        raise RuntimeError(f"{command[0]} was not found on PATH") from None
+        raise MissingToolError(
+            f"{command[0]} was not found on PATH.\n{_install_hint([command[0]])}"
+        ) from None
 
     output = _redact(f"{completed.stdout or ''}{completed.stderr or ''}", secrets or [])
     if completed.returncode not in ok_codes:

@@ -8,6 +8,7 @@ from .base_extractor import BaseExtractor, run_tool
 
 class PostgresExtractor(BaseExtractor):
     db_type = "postgres"
+    required_tools = ("pg_dump",)
 
     def connect(self):
         self.connection = psycopg.connect(self.connection_uri)

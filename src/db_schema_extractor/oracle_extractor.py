@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import oracledb
 
-from .base_extractor import BaseExtractor, run_tool
+from .base_extractor import BaseExtractor, MissingToolError, run_tool
 
 DUMP_DIRECTORY = "DATA_PUMP_DIR"
 _DATA_PUMP_OK = (0, 5)
@@ -47,6 +47,7 @@ END;
 
 class OracleExtractor(BaseExtractor):
     db_type = "oracle"
+    required_tools = ("expdp", "impdp")
 
     def connect(self):
         self.connection = oracledb.connect(**oracle_connect_params(self.connection_uri))
@@ -101,6 +102,8 @@ class OracleExtractor(BaseExtractor):
             )
             _warn_if_errors("impdp", code, output, self.connection, import_log)
             _copy_directory_file(self.connection, DUMP_DIRECTORY, sqlfile, output_path)
+        except MissingToolError:
+            raise
         except Exception as exc:
             raise RuntimeError(
                 f"{exc}\nCheck {DUMP_DIRECTORY} ({directory_path}) for "

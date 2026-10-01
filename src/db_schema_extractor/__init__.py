@@ -1,8 +1,10 @@
 import argparse
+import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .base_extractor import MissingToolError, require_tools
 from .oracle_extractor import OracleExtractor
 from .postgres_extractor import PostgresExtractor
 
@@ -60,15 +62,29 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
+    try:
+        require_tools(extractor.required_tools)
+    except MissingToolError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1) from None
+
     output_dir = Path(args.output_folder)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        _extract(extractor, output_dir, args.file_name)
+    except MissingToolError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def _extract(extractor, output_dir: Path, file_name: str | None) -> None:
     with extractor:
-        file_name = Path(args.file_name).name if args.file_name else schema_file_name(
+        name = Path(file_name).name if file_name else schema_file_name(
             extractor.database_name,
             extractor.db_type,
         )
-        output_path = output_dir / file_name
+        output_path = output_dir / name
         extractor.write_sql(output_path)
 
     print(f"Successfully extracted schema to {output_path}.")
