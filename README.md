@@ -19,6 +19,14 @@ A schema dump is useful, for example, to create a semantic relational graph with
 uv sync
 ```
 
+The image below already contains Python, `pg_dump`, `expdp`, and `impdp`. Use it when those tools are not installed on the machine.
+
+```bash
+docker build -t db-schema-extractor .
+```
+
+The image is `linux/amd64`. It includes PostgreSQL client 18, which can dump PostgreSQL 18 and older servers, and Oracle Instant Client 23.26 for Data Pump.
+
 ## Usage
 
 ```bash
@@ -40,6 +48,36 @@ uv run db_schema_extractor "oracle://user:password@dbhost:1521/?sid=ORCL" ./out 
 PostgreSQL accepts `postgresql://` and `postgres://`. Oracle uses `oracle://user:password@host[:port]/service_name`. The port defaults to `1521`. A SID can be passed as `?sid=ORCL` when the path has no service name. Percent-encode characters that are special in a URI, including `@` in the password (`%40`).
 
 The connection URI is a process argument, so the password is visible to other users on the machine and is stored in shell history. Oracle user names and passwords cannot contain a double quote.
+
+With Docker, mount a host directory and pass that path as the output folder. A remote database is reached by its hostname, with no extra host mapping.
+
+```bash
+docker run --rm \
+  -v "$PWD/out:/out" \
+  db-schema-extractor \
+  "postgresql://user:password@dbhost:5432/app" /out --schema public
+
+docker run --rm \
+  -v "$PWD/out:/out" \
+  db-schema-extractor \
+  "oracle://user:password@dbhost:1521/FREEPDB1" /out --schema hr
+```
+
+`localhost` inside the container is the container, so a database on the host is `host.docker.internal`. On Linux, add the host gateway.
+
+```bash
+docker run --rm --add-host=host.docker.internal:host-gateway \
+  -v "$PWD/out:/out" \
+  db-schema-extractor \
+  "postgresql://user:password@host.docker.internal:5432/app" /out --schema public
+
+docker run --rm --add-host=host.docker.internal:host-gateway \
+  -v "$PWD/out:/out" \
+  db-schema-extractor \
+  "oracle://user:password@host.docker.internal:1521/FREEPDB1" /out --schema hr
+```
+
+Data Pump still writes its dump on the database server in `DATA_PUMP_DIR`. The container copies the finished SQL file into the mounted folder.
 
 ## What is extracted
 
