@@ -7,7 +7,7 @@ Requires Python 3.13 or newer.
 ## Supported databases
 
 - PostgreSQL, via `pg_dump` on `PATH`
-- Oracle, via `expdp` and `impdp` on `PATH`
+- Oracle, via `DBMS_METADATA` over the database connection
 
 ## Why of this project
 
@@ -19,13 +19,13 @@ A schema dump is useful, for example, to create a semantic relational graph with
 uv sync
 ```
 
-The image below already contains Python, `pg_dump`, `expdp`, and `impdp`. Use it when those tools are not installed on the machine.
+The image below already contains Python and `pg_dump`. Use it when `pg_dump` is not installed on the machine. Oracle does not need a client tool.
 
 ```bash
 docker build -t db-schema-extractor .
 ```
 
-The image is `linux/amd64`. It includes PostgreSQL client 18, which can dump PostgreSQL 18 and older servers, and Oracle Instant Client 23.26 for Data Pump.
+It includes PostgreSQL client 18, which can dump PostgreSQL 18 and older servers.
 
 ## Usage
 
@@ -47,7 +47,7 @@ uv run db_schema_extractor "oracle://user:password@dbhost:1521/?sid=ORCL" ./out 
 
 PostgreSQL accepts `postgresql://` and `postgres://`. Oracle uses `oracle://user:password@host[:port]/service_name`. The port defaults to `1521`. A SID can be passed as `?sid=ORCL` when the path has no service name. Percent-encode characters that are special in a URI, including `@` in the password (`%40`).
 
-The connection URI is a process argument, so the password is visible to other users on the machine and is stored in shell history. Oracle user names and passwords cannot contain a double quote.
+The connection URI is a process argument, so the password is visible to other users on the machine and is stored in shell history.
 
 With Docker, mount a host directory and pass that path as the output folder. A remote database is reached by its hostname, with no extra host mapping.
 
@@ -77,8 +77,6 @@ docker run --rm --add-host=host.docker.internal:host-gateway \
   "oracle://user:password@host.docker.internal:1521/FREEPDB1" /out --schema hr
 ```
 
-Data Pump still writes its dump on the database server in `DATA_PUMP_DIR`. The container copies the finished SQL file into the mounted folder.
-
 ## What is extracted
 
 Each run writes one SQL file of schema DDL. Row data is not included.
@@ -94,24 +92,7 @@ pg_dump --schema-only --no-owner --no-privileges \
 
 `PGCLIENTENCODING` is set to `UTF8`. One `-n` is passed for each selected schema. The file includes tables, views, indexes, sequences, routines, constraints, and comments. Ownership and privileges are omitted.
 
-Oracle runs a metadata-only export, then renders that dump as SQL:
-
-```bash
-expdp user/password@CONNECT \
-  schemas=SCHEMA \
-  content=metadata_only \
-  directory=DATA_PUMP_DIR \
-  dumpfile=schema_meta.dmp \
-  logfile=schema_exp.log
-
-impdp user/password@CONNECT \
-  directory=DATA_PUMP_DIR \
-  dumpfile=schema_meta.dmp \
-  sqlfile=schema_meta.sql \
-  logfile=schema_imp.log
-```
-
-Data Pump writes the dump, logs, and SQL file on the database server, in the `DATA_PUMP_DIR` directory object. The connected user needs `READ` and `WRITE` on that directory. The tool copies the SQL file into `OUTPUT_FOLDER` and then removes the server-side dump, logs, and SQL file. A Data Pump exit code of 5 means the job finished with errors; those messages are printed and the SQL file is still copied when the job produced one.
+Oracle calls `DBMS_METADATA.GET_DDL` for sequences, tables, views, triggers, procedures, functions, packages, and package bodies in the selected schemas. Storage and tablespace clauses are omitted. An object that cannot be read is skipped and named on stderr.
 
 ## TODO
 

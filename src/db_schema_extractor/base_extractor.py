@@ -67,11 +67,6 @@ def _install_hint(missing: list[str]) -> str:
             "Install the PostgreSQL client tools, with a major version the same as "
             "the server or newer. On Debian or Ubuntu: sudo apt install postgresql-client"
         )
-    elif set(missing) <= {"expdp", "impdp"}:
-        install = (
-            "Install Oracle Instant Client Tools, which provides expdp and impdp, "
-            "and put that directory on PATH."
-        )
     else:
         install = "Install the missing program and make sure it is on PATH."
     return f"{install}\nOr use the Docker image, which already includes it."

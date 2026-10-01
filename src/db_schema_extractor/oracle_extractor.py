@@ -1,53 +1,34 @@
-import re
 import sys
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import oracledb
 
-from .base_extractor import BaseExtractor, MissingToolError, run_tool
+from .base_extractor import BaseExtractor
 
-DUMP_DIRECTORY = "DATA_PUMP_DIR"
-_DATA_PUMP_OK = (0, 5)
+_OBJECT_TYPES = (
+    "SEQUENCE",
+    "TABLE",
+    "VIEW",
+    "TRIGGER",
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+)
 
-_READ_FILE = """
-DECLARE
-    l_bfile BFILE;
-    l_clob CLOB;
-    l_dest_offset INTEGER := 1;
-    l_src_offset INTEGER := 1;
-    l_lang_context INTEGER := DBMS_LOB.DEFAULT_LANG_CTX;
-    l_warning INTEGER;
+_SET_TRANSFORMS = """
 BEGIN
-    l_bfile := BFILENAME(:directory, :filename);
-    DBMS_LOB.OPEN(l_bfile, DBMS_LOB.LOB_READONLY);
-    DBMS_LOB.CREATETEMPORARY(l_clob, TRUE);
-    DBMS_LOB.LOADCLOBFROMFILE(
-        l_clob,
-        l_bfile,
-        DBMS_LOB.LOBMAXSIZE,
-        l_dest_offset,
-        l_src_offset,
-        0,
-        l_lang_context,
-        l_warning
-    );
-    DBMS_LOB.CLOSE(l_bfile);
-    :content := l_clob;
-END;
-"""
-
-_REMOVE_FILE = """
-BEGIN
-    UTL_FILE.FREMOVE(:directory, :filename);
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'PRETTY', true);
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', true);
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', false);
 END;
 """
 
 
 class OracleExtractor(BaseExtractor):
     db_type = "oracle"
-    required_tools = ("expdp", "impdp")
+    required_tools = ()
 
     def connect(self):
         self.connection = oracledb.connect(**oracle_connect_params(self.connection_uri))
@@ -61,59 +42,21 @@ class OracleExtractor(BaseExtractor):
 
     def write_sql(self, output_path: Path) -> None:
         schemas = _selected_schemas(self.connection, self.schemas)
-        directory_path = _directory_path(self.connection, DUMP_DIRECTORY)
-        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        dumpfile = f"schema_meta_{stamp}.dmp"
-        export_log = f"schema_exp_{stamp}.log"
-        sqlfile = f"schema_meta_{stamp}.sql"
-        import_log = f"schema_imp_{stamp}.log"
-        connect = data_pump_connect(self.connection_uri)
-        secrets = _secrets(self.connection_uri)
+        partial = output_path.with_suffix(output_path.suffix + ".partial")
         try:
-            code, output = run_tool(
-                [
-                    "expdp",
-                    connect,
-                    f"schemas={','.join(_expdp_schema(schema) for schema in schemas)}",
-                    "content=metadata_only",
-                    f"directory={DUMP_DIRECTORY}",
-                    f"dumpfile={dumpfile}",
-                    f"logfile={export_log}",
-                    f"job_name=SCHEMA_EXP_{stamp}",
-                    "reuse_dumpfiles=yes",
-                ],
-                ok_codes=_DATA_PUMP_OK,
-                secrets=secrets,
-            )
-            _warn_if_errors("expdp", code, output, self.connection, export_log)
-
-            code, output = run_tool(
-                [
-                    "impdp",
-                    connect,
-                    f"directory={DUMP_DIRECTORY}",
-                    f"dumpfile={dumpfile}",
-                    f"sqlfile={sqlfile}",
-                    f"logfile={import_log}",
-                    f"job_name=SCHEMA_IMP_{stamp}",
-                ],
-                ok_codes=_DATA_PUMP_OK,
-                secrets=secrets,
-            )
-            _warn_if_errors("impdp", code, output, self.connection, import_log)
-            _copy_directory_file(self.connection, DUMP_DIRECTORY, sqlfile, output_path)
-        except MissingToolError:
+            with self.connection.cursor() as cursor, partial.open("w", encoding="utf-8") as handle:
+                cursor.execute(_SET_TRANSFORMS)
+                for schema in schemas:
+                    for object_type, object_name in _objects(cursor, schema):
+                        ddl = _ddl(cursor, object_type, object_name, schema)
+                        if not ddl:
+                            continue
+                        handle.write(ddl.strip())
+                        handle.write("\n\n")
+            partial.replace(output_path)
+        except Exception:
+            partial.unlink(missing_ok=True)
             raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"{exc}\nCheck {DUMP_DIRECTORY} ({directory_path}) for "
-                f"{dumpfile}, {export_log}, {sqlfile}, {import_log}"
-            ) from exc
-
-        for filename in (sqlfile, dumpfile, export_log, import_log):
-            warning = _remove_server_file(self.connection, filename)
-            if warning:
-                print(warning, file=sys.stderr)
 
 
 def oracle_connect_params(uri: str) -> dict:
@@ -141,20 +84,6 @@ def oracle_connect_params(uri: str) -> dict:
     }
 
 
-def data_pump_connect(uri: str) -> str:
-    params = oracle_connect_params(uri)
-    user = params["user"]
-    password = params["password"]
-    if '"' in user or '"' in password:
-        raise ValueError("Oracle user and password cannot contain a double quote")
-    return f'"{user}/{password}"@{params["dsn"]}'
-
-
-def _secrets(uri: str) -> list[str]:
-    params = oracle_connect_params(uri)
-    return [params["password"], data_pump_connect(uri), uri]
-
-
 def _selected_schemas(connection, schemas: list[str] | None) -> list[str]:
     if not schemas:
         with connection.cursor() as cursor:
@@ -172,103 +101,47 @@ def _selected_schemas(connection, schemas: list[str] | None) -> list[str]:
     return selected
 
 
-def _expdp_schema(name: str) -> str:
-    if re.fullmatch(r"[A-Z][A-Z0-9_$#]*", name):
-        return name
-    return '"' + name.replace('"', '""') + '"'
+def _objects(cursor, schema: str) -> list[tuple[str, str]]:
+    placeholders = ", ".join(f":type_{index}" for index in range(len(_OBJECT_TYPES)))
+    order = " ".join(
+        f"WHEN '{object_type}' THEN {index}" for index, object_type in enumerate(_OBJECT_TYPES)
+    )
+    binds = {f"type_{index}": object_type for index, object_type in enumerate(_OBJECT_TYPES)}
+    binds["schema"] = schema
+    cursor.execute(f"""
+        SELECT object_type, object_name
+        FROM all_objects
+        WHERE owner = :schema
+          AND object_type IN ({placeholders})
+          AND generated = 'N'
+          AND object_name NOT LIKE 'BIN$%'
+        ORDER BY CASE object_type {order} END, object_name
+    """, binds)
+    return cursor.fetchall()
 
 
-def _directory_path(connection, directory: str) -> str:
-    with connection.cursor() as cursor:
+def _ddl(cursor, object_type: str, object_name: str, schema: str) -> str:
+    try:
         cursor.execute(
-            """
-            SELECT directory_path
-            FROM all_directories
-            WHERE directory_name = :directory
-            """,
-            directory=directory,
+            "SELECT DBMS_METADATA.GET_DDL(:object_type, :object_name, :schema) FROM dual",
+            object_type=object_type.replace(" ", "_"),
+            object_name=object_name,
+            schema=schema,
         )
-        row = cursor.fetchone()
-    if row is None:
-        raise RuntimeError(
-            f"Directory object {directory} is not visible to this user. "
-            "Grant READ and WRITE on it before extracting."
-        )
-    return row[0]
-
-
-def _copy_directory_file(connection, directory: str, filename: str, output_path: Path) -> None:
-    partial = output_path.with_suffix(output_path.suffix + ".partial")
-    try:
-        with connection.cursor() as cursor:
-            content = cursor.var(oracledb.DB_TYPE_CLOB)
-            cursor.execute(_READ_FILE, directory=directory, filename=filename, content=content)
-            value = content.getvalue()
-            with partial.open("w", encoding="utf-8", newline="") as handle:
-                _write_clob(value, handle)
-        partial.replace(output_path)
-    except Exception:
-        partial.unlink(missing_ok=True)
-        raise
-
-
-def _write_clob(value, handle) -> None:
-    if value is None:
-        raise RuntimeError("The Data Pump SQL file was empty")
-    if hasattr(value, "read"):
-        wrote = False
-        while True:
-            chunk = value.read(1024 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
-            wrote = True
-        if not wrote:
-            raise RuntimeError("The Data Pump SQL file was empty")
-        return
-    if not value:
-        raise RuntimeError("The Data Pump SQL file was empty")
-    handle.write(value)
-
-
-def _read_text(connection, filename: str, limit: int = 20_000) -> str:
-    try:
-        with connection.cursor() as cursor:
-            content = cursor.var(oracledb.DB_TYPE_CLOB)
-            cursor.execute(
-                _READ_FILE,
-                directory=DUMP_DIRECTORY,
-                filename=filename,
-                content=content,
-            )
-            value = content.getvalue()
-            if value is None:
-                return ""
-            text = value.read(limit + 1) if hasattr(value, "read") else str(value)
-    except oracledb.Error:
-        return ""
-    if len(text) > limit:
-        return text[:limit] + "\n..."
-    return text
-
-
-def _warn_if_errors(tool: str, code: int, output: str, connection, logfile: str) -> None:
-    if code == 0:
-        return
-    detail = output.strip() or _read_text(connection, logfile).strip()
-    message = f"{tool} completed with errors"
-    if detail:
-        message = f"{message}:\n{detail}"
-    print(message, file=sys.stderr)
-
-
-def _remove_server_file(connection, filename: str) -> str | None:
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(_REMOVE_FILE, directory=DUMP_DIRECTORY, filename=filename)
+        value = cursor.fetchone()[0]
     except oracledb.Error as exc:
-        return f"Could not remove {DUMP_DIRECTORY}:{filename}: {exc}"
-    return None
+        message = str(exc).splitlines()[0]
+        print(f"Skipped {schema}.{object_name} ({object_type}): {message}", file=sys.stderr)
+        return ""
+    return _text(value)
+
+
+def _text(value) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "read"):
+        return value.read() or ""
+    return str(value)
 
 
 def _first(query: dict[str, list[str]], key: str) -> str | None:
