@@ -1,0 +1,51 @@
+import argparse
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+from .oracle_extractor import OracleExtractor
+from .postgres_extractor import PostgresExtractor
+
+def schema_file_name(database_name: str, db_type: str, when: datetime | None = None) -> str:
+    timestamp = (when or datetime.now()).strftime("%Y-%m-%d-%H-%M-%S")
+    safe_name = database_name.replace("/", "_").replace("\\", "_")
+    return f"{safe_name}_{db_type}-{timestamp}.json"
+
+def extractor_for(uri: str):
+    scheme = urlparse(uri).scheme.lower()
+    if scheme in {"postgres", "postgresql"}:
+        return PostgresExtractor(uri)
+    if scheme == "oracle":
+        return OracleExtractor(uri)
+    raise ValueError(f"Unsupported database URI scheme: {scheme or 'missing'}")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Extract a database schema.")
+    parser.add_argument("uri", help="Database connection URI")
+    parser.add_argument("output_folder", help="Folder where the schema JSON is written")
+    parser.add_argument(
+        "--file_name",
+        help="Output file name. Defaults to {db-name}_{db-type}-{YYYY-MM-DD-HH-MM-SS}.json",
+    )
+    args = parser.parse_args()
+
+    try:
+        extractor = extractor_for(args.uri)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    output_dir = Path(args.output_folder)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with extractor:
+        schema = extractor.extract_schema()
+        file_name = Path(args.file_name).name if args.file_name else schema_file_name(
+            schema.database_name,
+            extractor.db_type,
+        )
+        output_path = output_dir / file_name
+
+        with output_path.open("w") as f:
+            f.write(schema.model_dump_json(indent=2))
+
+        print(f"Successfully extracted {len(schema.tables)} tables to {output_path}.")

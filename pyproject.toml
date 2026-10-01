@@ -1,0 +1,21 @@
+[project]
+name = "db_schema_extractor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "g.petraroli", email = "g.petraroli@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "oracledb>=26.0.1",
+    "psycopg[binary]>=3.3.6",
+    "pydantic>=2.13.5",
+]
+
+[project.scripts]
+db_schema_extractor = "db_schema_extractor:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
