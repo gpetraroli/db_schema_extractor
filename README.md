@@ -9,6 +9,10 @@ Requires Python 3.13 or newer.
 - PostgreSQL
 - Oracle
 
+## Why of this project
+
+A schema dump is useful, for example, to create a semantic relational graph with [Graphify](https://github.com/Graphify-Labs/graphify).
+
 ## Install
 
 ```bash
