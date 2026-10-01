@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from .oracle_extractor import OracleExtractor
 from .postgres_extractor import PostgresExtractor
 
+
 def _schema_names(schemas: list[str] | None) -> list[str] | None:
     if not schemas:
         return None
@@ -22,7 +23,8 @@ def _schema_names(schemas: list[str] | None) -> list[str] | None:
 def schema_file_name(database_name: str, db_type: str, when: datetime | None = None) -> str:
     timestamp = (when or datetime.now()).strftime("%Y-%m-%d-%H-%M-%S")
     safe_name = database_name.replace("/", "_").replace("\\", "_")
-    return f"{safe_name}_{db_type}-{timestamp}.json"
+    return f"{safe_name}_{db_type}-{timestamp}.sql"
+
 
 def extractor_for(uri: str, schemas: list[str] | None = None):
     scheme = urlparse(uri).scheme.lower()
@@ -32,10 +34,11 @@ def extractor_for(uri: str, schemas: list[str] | None = None):
         return OracleExtractor(uri, schemas)
     raise ValueError(f"Unsupported database URI scheme: {scheme or 'missing'}")
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Extract a database schema.")
+    parser = argparse.ArgumentParser(description="Extract a database schema as SQL.")
     parser.add_argument("uri", help="Database connection URI")
-    parser.add_argument("output_folder", help="Folder where the schema JSON is written")
+    parser.add_argument("output_folder", help="Folder where the schema SQL is written")
     parser.add_argument(
         "--schema",
         action="append",
@@ -48,7 +51,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--file_name",
-        help="Output file name. Defaults to {db-name}_{db-type}-{YYYY-MM-DD-HH-MM-SS}.json",
+        help="Output file name. Defaults to {db-name}_{db-type}-{YYYY-MM-DD-HH-MM-SS}.sql",
     )
     args = parser.parse_args()
 
@@ -61,14 +64,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with extractor:
-        schema = extractor.extract_schema()
         file_name = Path(args.file_name).name if args.file_name else schema_file_name(
-            schema.database_name,
+            extractor.database_name,
             extractor.db_type,
         )
         output_path = output_dir / file_name
+        extractor.write_sql(output_path)
 
-        with output_path.open("w") as f:
-            f.write(schema.model_dump_json(indent=2))
-
-        print(f"Successfully extracted {len(schema.tables)} tables to {output_path}.")
+    print(f"Successfully extracted schema to {output_path}.")

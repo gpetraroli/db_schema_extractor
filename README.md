@@ -1,13 +1,13 @@
 # db_schema_extractor
 
-Extract tables, columns, primary keys, and foreign keys from a database into one JSON file.
+Extract a database schema as SQL.
 
 Requires Python 3.13 or newer.
 
 ## Supported databases
 
-- PostgreSQL
-- Oracle
+- PostgreSQL, via `pg_dump` on `PATH`
+- Oracle, via `expdp` and `impdp` on `PATH`
 
 ## Why of this project
 
@@ -25,7 +25,7 @@ uv sync
 uv run db_schema_extractor URI OUTPUT_FOLDER [--schema NAME ...] [--file_name NAME]
 ```
 
-`URI` selects the database. `OUTPUT_FOLDER` is created if it does not exist. The default file name is `{database}_{db-type}-{YYYY-MM-DD-HH-MM-SS}.json`. `--file_name` sets the file name only; any directory in that argument is ignored. An existing file with the same name is overwritten.
+`URI` selects the database. `OUTPUT_FOLDER` is created if it does not exist. The default file name is `{database}_{db-type}-{YYYY-MM-DD-HH-MM-SS}.sql`. `--file_name` sets the file name only; any directory in that argument is ignored. An existing file with the same name is overwritten.
 
 With no `--schema`, the tool reads the session schema (`current_schema()` on PostgreSQL, `CURRENT_SCHEMA` on Oracle). Repeat `--schema` to extract more than one. Names are folded to lowercase on PostgreSQL and uppercase on Oracle.
 
@@ -39,58 +39,41 @@ uv run db_schema_extractor "oracle://user:password@dbhost:1521/?sid=ORCL" ./out 
 
 PostgreSQL accepts `postgresql://` and `postgres://`. Oracle uses `oracle://user:password@host[:port]/service_name`. The port defaults to `1521`. A SID can be passed as `?sid=ORCL` when the path has no service name. Percent-encode characters that are special in a URI, including `@` in the password (`%40`).
 
-The connection URI is a process argument, so the password is visible to other users on the machine and is stored in shell history.
+The connection URI is a process argument, so the password is visible to other users on the machine and is stored in shell history. Oracle user names and passwords cannot contain a double quote.
 
 ## What is extracted
 
-Each dump contains base tables in the selected schemas:
+Each run writes one SQL file of schema DDL. Row data is not included.
 
-- PostgreSQL: ordinary and partitioned tables.
-- Oracle: tables visible in `ALL_TABLES`, excluding nested tables and index-organized overflow tables.
+PostgreSQL runs:
 
-Views, indexes, unique constraints, and check constraints are not included.
-
-Every foreign key is stored on its table, including composite keys and more than one foreign key on the same column. `columns` and `target_columns` stay in the same order, so each entry is one edge. A dump of a single schema uses bare table names. A dump of several schemas names tables `schema.table`, and foreign keys use that same form. A foreign key that points at another schema uses `schema.table` even in a single-schema dump. The referenced table is included in this file only when its schema was selected. A dump of another database stays a separate file; a later graph can link them when a target name matches a table there.
-
-PostgreSQL column types come from `format_type`, so length and precision are kept (`character varying(40)`, `numeric(10,2)`). Oracle column types are the data-dictionary type name, without length or precision (`VARCHAR2`, `NUMBER`). Descriptions are table and column comments.
-
-## Output
-
-```json
-{
-  "database_name": "app",
-  "tables": [
-    {
-      "name": "orders",
-      "description": "Customer orders",
-      "columns": [
-        {
-          "name": "id",
-          "data_type": "integer",
-          "is_nullable": false,
-          "is_primary_key": true,
-          "description": null
-        },
-        {
-          "name": "customer_id",
-          "data_type": "integer",
-          "is_nullable": false,
-          "is_primary_key": false,
-          "description": null
-        }
-      ],
-      "foreign_keys": [
-        {
-          "name": "orders_customer_id_fkey",
-          "columns": ["customer_id"],
-          "target_table": "customers",
-          "target_columns": ["id"]
-        }
-      ]
-    }
-  ]
-}
+```bash
+pg_dump --schema-only --no-owner --no-privileges \
+  -d URI \
+  -n schema \
+  -f OUTPUT.sql
 ```
+
+`PGCLIENTENCODING` is set to `UTF8`. One `-n` is passed for each selected schema. The file includes tables, views, indexes, sequences, routines, constraints, and comments. Ownership and privileges are omitted.
+
+Oracle runs a metadata-only export, then renders that dump as SQL:
+
+```bash
+expdp user/password@CONNECT \
+  schemas=SCHEMA \
+  content=metadata_only \
+  directory=DATA_PUMP_DIR \
+  dumpfile=schema_meta.dmp \
+  logfile=schema_exp.log
+
+impdp user/password@CONNECT \
+  directory=DATA_PUMP_DIR \
+  dumpfile=schema_meta.dmp \
+  sqlfile=schema_meta.sql \
+  logfile=schema_imp.log
+```
+
+Data Pump writes the dump, logs, and SQL file on the database server, in the `DATA_PUMP_DIR` directory object. The connected user needs `READ` and `WRITE` on that directory. The tool copies the SQL file into `OUTPUT_FOLDER` and then removes the server-side dump, logs, and SQL file. A Data Pump exit code of 5 means the job finished with errors; those messages are printed and the SQL file is still copied when the job produced one.
 
 ## TODO
 

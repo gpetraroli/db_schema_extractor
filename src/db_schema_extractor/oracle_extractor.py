@@ -1,103 +1,116 @@
-import oracledb
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .base_extractor import BaseExtractor
-from .models import ColumnMetadata, ForeignKeyMetadata, SchemaDump, TableMetadata
+import oracledb
+
+from .base_extractor import BaseExtractor, run_tool
+
+DUMP_DIRECTORY = "DATA_PUMP_DIR"
+_DATA_PUMP_OK = (0, 5)
+
+_READ_FILE = """
+DECLARE
+    l_bfile BFILE;
+    l_clob CLOB;
+    l_dest_offset INTEGER := 1;
+    l_src_offset INTEGER := 1;
+    l_lang_context INTEGER := DBMS_LOB.DEFAULT_LANG_CTX;
+    l_warning INTEGER;
+BEGIN
+    l_bfile := BFILENAME(:directory, :filename);
+    DBMS_LOB.OPEN(l_bfile, DBMS_LOB.LOB_READONLY);
+    DBMS_LOB.CREATETEMPORARY(l_clob, TRUE);
+    DBMS_LOB.LOADCLOBFROMFILE(
+        l_clob,
+        l_bfile,
+        DBMS_LOB.LOBMAXSIZE,
+        l_dest_offset,
+        l_src_offset,
+        0,
+        l_lang_context,
+        l_warning
+    );
+    DBMS_LOB.CLOSE(l_bfile);
+    :content := l_clob;
+END;
+"""
+
+_REMOVE_FILE = """
+BEGIN
+    UTL_FILE.FREMOVE(:directory, :filename);
+END;
+"""
+
 
 class OracleExtractor(BaseExtractor):
     db_type = "oracle"
 
     def connect(self):
         self.connection = oracledb.connect(**oracle_connect_params(self.connection_uri))
+        with self.connection.cursor() as cursor:
+            cursor.execute("SELECT SYS_CONTEXT('USERENV', 'DB_NAME') FROM dual")
+            self._database_name = cursor.fetchone()[0]
 
     def disconnect(self):
         if self.connection:
             self.connection.close()
 
-    def extract_schema(self) -> SchemaDump:
-        with self.connection.cursor() as cursor:
-            database_name = _fetch_dicts(
-                cursor,
-                "SELECT SYS_CONTEXT('USERENV', 'DB_NAME') AS database_name FROM dual",
-            )[0]["database_name"]
-            visible_tables = _visible_tables(cursor, _selected_schemas(self.schemas))
-            if not visible_tables:
-                return SchemaDump(database_name=database_name, tables=[])
+    def write_sql(self, output_path: Path) -> None:
+        schemas = _selected_schemas(self.connection, self.schemas)
+        directory_path = _directory_path(self.connection, DUMP_DIRECTORY)
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        dumpfile = f"schema_meta_{stamp}.dmp"
+        export_log = f"schema_exp_{stamp}.log"
+        sqlfile = f"schema_meta_{stamp}.sql"
+        import_log = f"schema_imp_{stamp}.log"
+        connect = data_pump_connect(self.connection_uri)
+        secrets = _secrets(self.connection_uri)
+        try:
+            code, output = run_tool(
+                [
+                    "expdp",
+                    connect,
+                    f"schemas={','.join(_expdp_schema(schema) for schema in schemas)}",
+                    "content=metadata_only",
+                    f"directory={DUMP_DIRECTORY}",
+                    f"dumpfile={dumpfile}",
+                    f"logfile={export_log}",
+                    f"job_name=SCHEMA_EXP_{stamp}",
+                    "reuse_dumpfiles=yes",
+                ],
+                ok_codes=_DATA_PUMP_OK,
+                secrets=secrets,
+            )
+            _warn_if_errors("expdp", code, output, self.connection, export_log)
 
-            table_rows = _rows_by_owner(cursor, visible_tables, """
-                SELECT
-                    t.owner,
-                    t.table_name,
-                    c.comments AS table_description
-                FROM all_tables t
-                LEFT JOIN all_tab_comments c
-                    ON c.owner = t.owner
-                   AND c.table_name = t.table_name
-                   AND c.table_type = 'TABLE'
-                WHERE t.owner = :owner
-                  AND t.table_name IN ({tables})
-                ORDER BY t.table_name
-            """)
-            column_rows = _rows_by_owner(cursor, visible_tables, """
-                SELECT
-                    col.owner,
-                    col.table_name,
-                    col.column_name,
-                    col.data_type,
-                    col.nullable,
-                    cc.comments AS description
-                FROM all_tab_columns col
-                LEFT JOIN all_col_comments cc
-                    ON cc.owner = col.owner
-                   AND cc.table_name = col.table_name
-                   AND cc.column_name = col.column_name
-                WHERE col.owner = :owner
-                  AND col.table_name IN ({tables})
-                ORDER BY col.table_name, col.column_id
-            """)
-            primary_key_rows = _rows_by_owner(cursor, visible_tables, """
-                SELECT cons.owner, cols.table_name, cols.column_name
-                FROM all_constraints cons
-                JOIN all_cons_columns cols
-                    ON cons.owner = cols.owner
-                   AND cons.constraint_name = cols.constraint_name
-                WHERE cons.constraint_type = 'P'
-                  AND cons.owner = :owner
-                  AND cons.table_name IN ({tables})
-            """)
-            foreign_key_rows = _rows_by_owner(cursor, visible_tables, """
-                SELECT
-                    cons.owner,
-                    cols.table_name,
-                    cons.constraint_name,
-                    cols.column_name,
-                    rcols.owner AS foreign_owner,
-                    rcols.table_name AS foreign_table_name,
-                    rcols.column_name AS foreign_column_name
-                FROM all_constraints cons
-                JOIN all_cons_columns cols
-                    ON cons.owner = cols.owner
-                   AND cons.constraint_name = cols.constraint_name
-                JOIN all_constraints rcons
-                    ON cons.r_owner = rcons.owner
-                   AND cons.r_constraint_name = rcons.constraint_name
-                JOIN all_cons_columns rcols
-                    ON rcons.owner = rcols.owner
-                   AND rcons.constraint_name = rcols.constraint_name
-                   AND cols.position = rcols.position
-                WHERE cons.constraint_type = 'R'
-                  AND cons.owner = :owner
-                  AND cons.table_name IN ({tables})
-                ORDER BY cols.table_name, cons.constraint_name, cols.position
-            """)
+            code, output = run_tool(
+                [
+                    "impdp",
+                    connect,
+                    f"directory={DUMP_DIRECTORY}",
+                    f"dumpfile={dumpfile}",
+                    f"sqlfile={sqlfile}",
+                    f"logfile={import_log}",
+                    f"job_name=SCHEMA_IMP_{stamp}",
+                ],
+                ok_codes=_DATA_PUMP_OK,
+                secrets=secrets,
+            )
+            _warn_if_errors("impdp", code, output, self.connection, import_log)
+            _copy_directory_file(self.connection, DUMP_DIRECTORY, sqlfile, output_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{exc}\nCheck {DUMP_DIRECTORY} ({directory_path}) for "
+                f"{dumpfile}, {export_log}, {sqlfile}, {import_log}"
+            ) from exc
 
-        return _schema_from_rows(
-            database_name,
-            table_rows,
-            column_rows,
-            primary_key_rows,
-            foreign_key_rows,
-        )
+        for filename in (sqlfile, dumpfile, export_log, import_log):
+            warning = _remove_server_file(self.connection, filename)
+            if warning:
+                print(warning, file=sys.stderr)
 
 
 def oracle_connect_params(uri: str) -> dict:
@@ -125,47 +138,29 @@ def oracle_connect_params(uri: str) -> dict:
     }
 
 
-def _schema_from_rows(
-    database_name: str,
-    table_rows: list[dict],
-    column_rows: list[dict],
-    primary_key_rows: list[dict],
-    foreign_key_rows: list[dict],
-) -> SchemaDump:
-    qualify_names = len({row["owner"] for row in table_rows}) > 1
-    primary_keys = {
-        (row["owner"], row["table_name"], row["column_name"]) for row in primary_key_rows
-    }
-    foreign_keys = _foreign_keys(foreign_key_rows, qualify_names)
-
-    tables = {
-        (row["owner"], row["table_name"]): TableMetadata(
-            name=_table_name(row["owner"], row["table_name"], qualify_names),
-            description=row["table_description"],
-            columns=[],
-            foreign_keys=foreign_keys.get((row["owner"], row["table_name"]), []),
-        )
-        for row in table_rows
-    }
-    for row in column_rows:
-        table = tables.get((row["owner"], row["table_name"]))
-        if table is None:
-            continue
-        key = (row["owner"], row["table_name"], row["column_name"])
-        table.columns.append(ColumnMetadata(
-            name=row["column_name"],
-            data_type=row["data_type"],
-            is_nullable=row["nullable"] == "Y",
-            is_primary_key=key in primary_keys,
-            description=row["description"],
-        ))
-
-    return SchemaDump(database_name=database_name, tables=list(tables.values()))
+def data_pump_connect(uri: str) -> str:
+    params = oracle_connect_params(uri)
+    user = params["user"]
+    password = params["password"]
+    if '"' in user or '"' in password:
+        raise ValueError("Oracle user and password cannot contain a double quote")
+    return f'"{user}/{password}"@{params["dsn"]}'
 
 
-def _selected_schemas(schemas: list[str] | None) -> list[str] | None:
+def _secrets(uri: str) -> list[str]:
+    params = oracle_connect_params(uri)
+    return [params["password"], data_pump_connect(uri), uri]
+
+
+def _selected_schemas(connection, schemas: list[str] | None) -> list[str]:
     if not schemas:
-        return None
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
+            schema = cursor.fetchone()[0]
+        if not schema:
+            raise ValueError("No schema selected and the session has no current schema")
+        schemas = [schema]
+
     selected = []
     for schema in schemas:
         name = schema.upper()
@@ -174,87 +169,103 @@ def _selected_schemas(schemas: list[str] | None) -> list[str] | None:
     return selected
 
 
-def _visible_tables(cursor, schemas: list[str] | None) -> list[tuple[str, str]]:
-    if not schemas:
-        rows = _fetch_dicts(cursor, """
-            SELECT owner, table_name
-            FROM all_tables
-            WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
-              AND nested = 'NO'
-              AND iot_name IS NULL
-            ORDER BY table_name
-        """)
-        return [(row["owner"], row["table_name"]) for row in rows]
-
-    visible = []
-    for offset in range(0, len(schemas), 500):
-        placeholders, binds = _in_binds(schemas[offset:offset + 500], prefix="schema")
-        rows = _fetch_dicts(cursor, """
-            SELECT owner, table_name
-            FROM all_tables
-            WHERE owner IN ({schemas})
-              AND nested = 'NO'
-              AND iot_name IS NULL
-            ORDER BY owner, table_name
-        """.format(schemas=placeholders), binds)
-        visible.extend((row["owner"], row["table_name"]) for row in rows)
-    return visible
+def _expdp_schema(name: str) -> str:
+    if re.fullmatch(r"[A-Z][A-Z0-9_$#]*", name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
 
 
-def _rows_by_owner(cursor, tables: list[tuple[str, str]], query: str) -> list[dict]:
-    by_owner: dict[str, list[str]] = {}
-    for owner, table_name in tables:
-        by_owner.setdefault(owner, []).append(table_name)
+def _directory_path(connection, directory: str) -> str:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT directory_path
+            FROM all_directories
+            WHERE directory_name = :directory
+            """,
+            directory=directory,
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"Directory object {directory} is not visible to this user. "
+            "Grant READ and WRITE on it before extracting."
+        )
+    return row[0]
 
-    rows = []
-    for owner, names in by_owner.items():
-        for offset in range(0, len(names), 500):
-            placeholders, binds = _in_binds(names[offset:offset + 500])
-            binds["owner"] = owner
-            rows.extend(_fetch_dicts(cursor, query.format(tables=placeholders), binds))
-    return rows
+
+def _copy_directory_file(connection, directory: str, filename: str, output_path: Path) -> None:
+    partial = output_path.with_suffix(output_path.suffix + ".partial")
+    try:
+        with connection.cursor() as cursor:
+            content = cursor.var(oracledb.DB_TYPE_CLOB)
+            cursor.execute(_READ_FILE, directory=directory, filename=filename, content=content)
+            value = content.getvalue()
+            with partial.open("w", encoding="utf-8", newline="") as handle:
+                _write_clob(value, handle)
+        partial.replace(output_path)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
 
 
-def _in_binds(names: list[str], prefix: str = "table") -> tuple[str, dict[str, str]]:
-    binds = {f"{prefix}_{index}": name for index, name in enumerate(names)}
-    placeholders = ", ".join(f":{prefix}_{index}" for index in range(len(names)))
-    return placeholders, binds
+def _write_clob(value, handle) -> None:
+    if value is None:
+        raise RuntimeError("The Data Pump SQL file was empty")
+    if hasattr(value, "read"):
+        wrote = False
+        while True:
+            chunk = value.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+            wrote = True
+        if not wrote:
+            raise RuntimeError("The Data Pump SQL file was empty")
+        return
+    if not value:
+        raise RuntimeError("The Data Pump SQL file was empty")
+    handle.write(value)
 
 
-def _foreign_keys(rows: list[dict], qualify_names: bool) -> dict[tuple[str, str], list[ForeignKeyMetadata]]:
-    by_table: dict[tuple[str, str], list[ForeignKeyMetadata]] = {}
-    by_constraint: dict[tuple[str, str, str], ForeignKeyMetadata] = {}
-    for row in rows:
-        table_key = (row["owner"], row["table_name"])
-        constraint_key = (*table_key, row["constraint_name"])
-        foreign_key = by_constraint.get(constraint_key)
-        if foreign_key is None:
-            target_table = row["foreign_table_name"]
-            if qualify_names or row["foreign_owner"] != row["owner"]:
-                target_table = f"{row['foreign_owner']}.{target_table}"
-            foreign_key = ForeignKeyMetadata(
-                name=row["constraint_name"],
-                columns=[],
-                target_table=target_table,
-                target_columns=[],
+def _read_text(connection, filename: str, limit: int = 20_000) -> str:
+    try:
+        with connection.cursor() as cursor:
+            content = cursor.var(oracledb.DB_TYPE_CLOB)
+            cursor.execute(
+                _READ_FILE,
+                directory=DUMP_DIRECTORY,
+                filename=filename,
+                content=content,
             )
-            by_constraint[constraint_key] = foreign_key
-            by_table.setdefault(table_key, []).append(foreign_key)
-        foreign_key.columns.append(row["column_name"])
-        foreign_key.target_columns.append(row["foreign_column_name"])
-    return by_table
+            value = content.getvalue()
+            if value is None:
+                return ""
+            text = value.read(limit + 1) if hasattr(value, "read") else str(value)
+    except oracledb.Error:
+        return ""
+    if len(text) > limit:
+        return text[:limit] + "\n..."
+    return text
 
 
-def _table_name(owner: str, table_name: str, qualify: bool) -> str:
-    if qualify:
-        return f"{owner}.{table_name}"
-    return table_name
+def _warn_if_errors(tool: str, code: int, output: str, connection, logfile: str) -> None:
+    if code == 0:
+        return
+    detail = output.strip() or _read_text(connection, logfile).strip()
+    message = f"{tool} completed with errors"
+    if detail:
+        message = f"{message}:\n{detail}"
+    print(message, file=sys.stderr)
 
 
-def _fetch_dicts(cursor, query: str, parameters: dict | None = None) -> list[dict]:
-    cursor.execute(query, parameters or {})
-    names = [column[0].lower() for column in cursor.description]
-    return [dict(zip(names, row)) for row in cursor.fetchall()]
+def _remove_server_file(connection, filename: str) -> str | None:
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(_REMOVE_FILE, directory=DUMP_DIRECTORY, filename=filename)
+    except oracledb.Error as exc:
+        return f"Could not remove {DUMP_DIRECTORY}:{filename}: {exc}"
+    return None
 
 
 def _first(query: dict[str, list[str]], key: str) -> str | None:
