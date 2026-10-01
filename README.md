@@ -1,8 +1,13 @@
 # db_schema_extractor
 
-Extract tables, columns, primary keys, and foreign keys from PostgreSQL or Oracle into one JSON file.
+Extract tables, columns, primary keys, and foreign keys from a database into one JSON file.
 
 Requires Python 3.13 or newer.
+
+## Supported databases
+
+- PostgreSQL
+- Oracle
 
 ## Install
 
@@ -82,3 +87,7 @@ PostgreSQL column types come from `format_type`, so length and precision are kep
   ]
 }
 ```
+
+## TODO
+
+- Add connectors for other databases and APIs.

@@ -1,7 +1,7 @@
 [project]
 name = "db_schema_extractor"
 version = "0.1.0"
-description = "Extract a PostgreSQL or Oracle schema to JSON"
+description = "Extract a database schema to JSON"
 readme = "README.md"
 authors = [
     { name = "g.petraroli", email = "g.petraroli@gmail.com" }
