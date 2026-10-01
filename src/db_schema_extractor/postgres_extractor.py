@@ -2,7 +2,80 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .base_extractor import BaseExtractor
-from .models import SchemaDump, TableMetadata, ColumnMetadata
+from .models import ColumnMetadata, SchemaDump, TableMetadata
+
+_TABLES_QUERY = """
+    SELECT
+        n.nspname AS table_schema,
+        c.relname AS table_name,
+        pg_catalog.obj_description(c.oid, 'pg_class') AS description
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = %(schema)s
+      AND c.relkind IN ('r', 'p')
+    ORDER BY c.relname
+"""
+
+_COLUMNS_QUERY = """
+    SELECT
+        n.nspname AS table_schema,
+        c.relname AS table_name,
+        a.attname AS column_name,
+        pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+        NOT a.attnotnull AS is_nullable,
+        pg_catalog.col_description(c.oid, a.attnum) AS description
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = %(schema)s
+      AND c.relkind IN ('r', 'p')
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+    ORDER BY c.relname, a.attnum
+"""
+
+_PRIMARY_KEYS_QUERY = """
+    SELECT
+        n.nspname AS table_schema,
+        c.relname AS table_name,
+        a.attname AS column_name
+    FROM pg_catalog.pg_constraint con
+    JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN LATERAL unnest(con.conkey) AS key(attnum) ON true
+    JOIN pg_catalog.pg_attribute a
+        ON a.attrelid = c.oid
+       AND a.attnum = key.attnum
+    WHERE con.contype = 'p'
+      AND n.nspname = %(schema)s
+"""
+
+_FOREIGN_KEYS_QUERY = """
+    SELECT
+        n.nspname AS table_schema,
+        c.relname AS table_name,
+        a.attname AS column_name,
+        fn.nspname AS foreign_schema,
+        fc.relname AS foreign_table_name,
+        fa.attname AS foreign_column_name
+    FROM pg_catalog.pg_constraint con
+    JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
+    JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
+    JOIN LATERAL unnest(con.conkey, con.confkey)
+        WITH ORDINALITY AS cols(attnum, fattnum, ord) ON true
+    JOIN pg_catalog.pg_attribute a
+        ON a.attrelid = c.oid
+       AND a.attnum = cols.attnum
+    JOIN pg_catalog.pg_attribute fa
+        ON fa.attrelid = fc.oid
+       AND fa.attnum = cols.fattnum
+    WHERE con.contype = 'f'
+      AND n.nspname = %(schema)s
+    ORDER BY c.relname, con.conname, cols.ord
+"""
+
 
 class PostgresExtractor(BaseExtractor):
     db_type = "postgres"
@@ -15,68 +88,63 @@ class PostgresExtractor(BaseExtractor):
             self.connection.close()
 
     def extract_schema(self) -> SchemaDump:
-        tables = []
-        db_name = self.connection.info.dbname
-
-        # Query updated to fetch table descriptions
-        tables_query = """
-            SELECT 
-                table_name,
-                table_schema,
-                pg_catalog.obj_description((table_schema || '.' || table_name)::regclass, 'pg_class') AS description
-            FROM information_schema.tables 
-            WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
-        """
-        
-        # Query updated to fetch column descriptions based on their ordinal position
-        columns_query = """
-            SELECT 
-                c.column_name, 
-                c.data_type, 
-                c.is_nullable,
-                tc.constraint_type,
-                ccu.table_name AS foreign_table_name,
-                ccu.column_name AS foreign_column_name,
-                pg_catalog.col_description((c.table_schema || '.' || c.table_name)::regclass::oid, c.ordinal_position) AS description
-            FROM information_schema.columns c
-            LEFT JOIN information_schema.key_column_usage kcu
-                ON c.column_name = kcu.column_name AND c.table_name = kcu.table_name
-            LEFT JOIN information_schema.table_constraints tc
-                ON kcu.constraint_name = tc.constraint_name AND tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')
-            LEFT JOIN information_schema.constraint_column_usage ccu
-                ON tc.constraint_name = ccu.constraint_name AND tc.constraint_type = 'FOREIGN KEY'
-            WHERE c.table_name = %s AND c.table_schema = %s;
-        """
-
+        schema = "public"
         with self.connection.cursor() as cursor:
-            table_rows = cursor.execute(tables_query).fetchall()
-            
-            for tbl in table_rows:
-                table_name = tbl['table_name']
-                table_schema = tbl['table_schema']
-                table_desc = tbl['description']
-                
-                col_rows = cursor.execute(columns_query, (table_name, table_schema)).fetchall()
-                
-                columns = []
-                for col in col_rows:
-                    fk_target = None
-                    if col['constraint_type'] == 'FOREIGN KEY' and col['foreign_table_name']:
-                        fk_target = f"{col['foreign_table_name']}.{col['foreign_column_name']}"
+            table_rows = cursor.execute(_TABLES_QUERY, {"schema": schema}).fetchall()
+            column_rows = cursor.execute(_COLUMNS_QUERY, {"schema": schema}).fetchall()
+            primary_key_rows = cursor.execute(_PRIMARY_KEYS_QUERY, {"schema": schema}).fetchall()
+            foreign_key_rows = cursor.execute(_FOREIGN_KEYS_QUERY, {"schema": schema}).fetchall()
 
-                    columns.append(ColumnMetadata(
-                        name=col['column_name'],
-                        data_type=col['data_type'],
-                        is_nullable=(col['is_nullable'] == 'YES'),
-                        is_primary_key=(col['constraint_type'] == 'PRIMARY KEY'),
-                        foreign_key_target=fk_target,
-                        description=col['description']
-                    ))
-                    
-                tables.append(TableMetadata(
-                    name=table_name, 
-                    description=table_desc,
-                    columns=columns
-                ))
+        return _schema_from_rows(
+            self.connection.info.dbname,
+            table_rows,
+            column_rows,
+            primary_key_rows,
+            foreign_key_rows,
+        )
 
-        return SchemaDump(database_name=db_name, tables=tables)
+
+def _schema_from_rows(
+    database_name: str,
+    table_rows: list[dict],
+    column_rows: list[dict],
+    primary_key_rows: list[dict],
+    foreign_key_rows: list[dict],
+) -> SchemaDump:
+    primary_keys = {
+        (row["table_schema"], row["table_name"], row["column_name"])
+        for row in primary_key_rows
+    }
+    foreign_keys: dict[tuple[str, str, str], str] = {}
+    for row in foreign_key_rows:
+        key = (row["table_schema"], row["table_name"], row["column_name"])
+        if key in foreign_keys:
+            continue
+        target = f"{row['foreign_table_name']}.{row['foreign_column_name']}"
+        if row["foreign_schema"] != row["table_schema"]:
+            target = f"{row['foreign_schema']}.{target}"
+        foreign_keys[key] = target
+
+    tables = {
+        (row["table_schema"], row["table_name"]): TableMetadata(
+            name=row["table_name"],
+            description=row["description"],
+            columns=[],
+        )
+        for row in table_rows
+    }
+    for row in column_rows:
+        table = tables.get((row["table_schema"], row["table_name"]))
+        if table is None:
+            continue
+        key = (row["table_schema"], row["table_name"], row["column_name"])
+        table.columns.append(ColumnMetadata(
+            name=row["column_name"],
+            data_type=row["data_type"],
+            is_nullable=row["is_nullable"],
+            is_primary_key=key in primary_keys,
+            foreign_key_target=foreign_keys.get(key),
+            description=row["description"],
+        ))
+
+    return SchemaDump(database_name=database_name, tables=list(tables.values()))
